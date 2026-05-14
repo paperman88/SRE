@@ -1,0 +1,5 @@
+# Data Domain Inventory
+# Format: <hostname_or_IP>
+dd-prod-01.example.com
+dd-prod-02.example.com
+dd-dr-01.example.com
