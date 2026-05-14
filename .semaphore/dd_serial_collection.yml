@@ -1,0 +1,96 @@
+version: v1.0
+name: Data Domain HDD Serial Number Collection
+agent:
+  machine:
+    type: e1-standard-2
+    os_image: ubuntu2204
+
+global_job_config:
+  secrets:
+    - name: dd-credentials
+
+blocks:
+
+  - name: Collect via SSH
+    task:
+      secrets:
+        - name: dd-ssh-key
+      env_vars:
+        - name: DD_INVENTORY
+          value: dd_inventory.txt
+        - name: OUTPUT_DIR
+          value: artifacts
+      jobs:
+        - name: SSH Serial Collection
+          commands:
+            - sudo apt-get install -y -q sshpass
+            - |
+              if [ -n "$DD_SSH_KEY_DATA" ]; then
+                mkdir -p ~/.ssh
+                echo "$DD_SSH_KEY_DATA" > ~/.ssh/dd_key
+                chmod 600 ~/.ssh/dd_key
+                export DD_SSH_KEY=~/.ssh/dd_key
+              fi
+            - mkdir -p artifacts
+            - python3 scripts/collect_dd_serials_ssh.py
+            - artifact push workflow artifacts/ --destination dd-serials-ssh
+
+  - name: Collect via REST API
+    task:
+      env_vars:
+        - name: DD_INVENTORY
+          value: dd_inventory.txt
+        - name: OUTPUT_DIR
+          value: artifacts
+        - name: DD_REST_PORT
+          value: "3009"
+        - name: DD_VERIFY_SSL
+          value: "false"
+      jobs:
+        - name: REST Serial Collection
+          commands:
+            - pip install requests --quiet
+            - mkdir -p artifacts
+            - python3 scripts/collect_dd_serials_rest.py
+            - artifact push workflow artifacts/ --destination dd-serials-rest
+
+  - name: Merge Results
+    dependencies:
+      - Collect via SSH
+      - Collect via REST API
+    task:
+      jobs:
+        - name: Merge CSVs
+          commands:
+            - mkdir -p artifacts/ssh artifacts/rest merged
+            - artifact pull workflow dd-serials-ssh --destination artifacts/ssh
+            - artifact pull workflow dd-serials-rest --destination artifacts/rest
+            - |
+              python3 - <<'EOF'
+              import csv, glob, os
+              from datetime import datetime
+
+              all_rows = []
+              seen = set()
+              fieldnames = ["hostname","disk_id","status","model","serial","collected_at","source"]
+
+              for pattern, source in [("artifacts/ssh/*.csv","ssh"), ("artifacts/rest/*.csv","rest")]:
+                  for f in glob.glob(pattern):
+                      with open(f) as fh:
+                          for row in csv.DictReader(fh):
+                              key = (row["hostname"], row["disk_id"], row["serial"])
+                              if key not in seen:
+                                  seen.add(key)
+                                  row["source"] = source
+                                  all_rows.append(row)
+
+              ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+              out = f"merged/dd_serials_merged_{ts}.csv"
+              with open(out, "w", newline="") as fh:
+                  w = csv.DictWriter(fh, fieldnames=fieldnames, extrasaction="ignore")
+                  w.writeheader()
+                  w.writerows(all_rows)
+
+              print(f"Merged {len(all_rows)} unique disk entries -> {out}")
+              EOF
+            - artifact push workflow merged/ --destination dd-serials-final
